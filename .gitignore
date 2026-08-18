@@ -1,0 +1,12 @@
+# Arduino / arduino-cli 构建产物
+build/
+*.bin
+*.hex
+*.elf
+*.map
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
