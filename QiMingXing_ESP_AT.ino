@@ -37,6 +37,10 @@ bool    webActive = false;
 String lastData   = "";
 String stationIP  = "";
 
+/* ---- 配网 WiFi 扫描状态（ESP 后台异步扫描，网页轮询取缓存结果）---- */
+String  lastScanJson = "[]";
+int     scanState    = 0;   /* 0=空闲可启动, 1=扫描中 */
+
 /* ---- OTA 转发状态（ESP -> STM32 二进制协议）---- */
 bool     otaInProgress = false;
 uint32_t otaTotal      = 0;
@@ -179,28 +183,49 @@ static const char CONFIG_PAGE[] PROGMEM = R"=====(
  body{font-family:-apple-system,Segoe UI,Arial,sans-serif;margin:0;background:#0f1830;color:#eaf0ff;display:flex;min-height:100vh;align-items:center;justify-content:center}
  .card{background:#172347;border:1px solid #2a3a66;border-radius:18px;padding:32px;width:340px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
  h2{margin:0 0 22px;color:#7cc4ff}
- select,input{width:100%;padding:12px;margin-bottom:16px;background:#101a36;border:1px solid #2a3a66;border-radius:10px;color:#eaf0ff;box-sizing:border-box}
- button{width:100%;background:linear-gradient(90deg,#3b6cff,#7c4dff);color:#fff;border:0;border-radius:12px;padding:14px;font-size:16px;cursor:pointer}
+ .row{display:flex;gap:10px;margin-bottom:16px}
+ select{flex:1;min-width:0;padding:12px;background:#101a36;border:1px solid #2a3a66;border-radius:10px;color:#eaf0ff;box-sizing:border-box}
+ .rf{flex:0 0 46px;background:#101a36;border:1px solid #2a3a66;border-radius:10px;color:#7cc4ff;font-size:20px;cursor:pointer;padding:0}
+ .rf:active{background:#1c2a52}
+ input{width:100%;padding:12px;margin-bottom:16px;background:#101a36;border:1px solid #2a3a66;border-radius:10px;color:#eaf0ff;box-sizing:border-box}
+ button.go{width:100%;background:linear-gradient(90deg,#3b6cff,#7c4dff);color:#fff;border:0;border-radius:12px;padding:14px;font-size:16px;cursor:pointer}
  .msg{margin-top:14px;font-size:13px;color:#9fb0e0;min-height:18px}
 </style></head>
 <body><div class=card>
  <h2>WiFi 配网</h2>
- <select id=ssid><option>点击扫描获取网络</option></select>
+ <div class=row>
+  <select id=ssid><option value="">正在扫描附近网络…</option></select>
+  <button class=rf id=rf onclick=doScan() title="刷新">⟳</button>
+ </div>
  <input id=pass type=password placeholder="WiFi 密码（开放网络留空）">
- <button onclick=scan()>扫描网络</button>
- <button onclick=conn() style="margin-top:12px">连接</button>
- <div class=msg id=m></div>
+ <button class=go onclick=conn()>连接</button>
+ <div class=msg id=m>进入页面自动扫描一次，可点 ⟳ 手动刷新</div>
 </div>
 <script>
-function scan(){ var m=document.getElementById('m'); m.textContent='扫描中…';
- fetch('/scan').then(r=>r.json()).then(a=>{ var s=document.getElementById('ssid'); s.innerHTML='';
-  a.forEach(n=>{ var o=document.createElement('option'); o.value=n.ssid; o.textContent=n.ssid+' ('+n.rssi+')'; s.appendChild(o); });
-  m.textContent='共 '+a.length+' 个网络'; }).catch(()=>m.textContent='扫描失败'); }
+var polling=null;
+function render(a){
+ var s=document.getElementById('ssid'), sel=s.value, m=document.getElementById('m');
+ s.innerHTML='';
+ if(!a.length){ s.innerHTML='<option value="">未找到网络</option>'; m.textContent='未找到网络，请点击 ⟳ 手动刷新'; return; }
+ a.forEach(function(n){ var o=document.createElement('option'); o.value=n.ssid; o.textContent=n.ssid; if(n.ssid===sel)o.selected=true; s.appendChild(o); });
+ m.textContent='共 '+a.length+' 个网络';
+}
+function poll(){
+ fetch('/scan').then(function(r){return r.json();}).then(function(j){
+  var rf=document.getElementById('rf');
+  if(j.scanning){ document.getElementById('m').textContent='扫描中…'; rf.style.opacity=.5; polling=setTimeout(poll,700); return; }
+  rf.style.opacity=1; render(j.nets);
+ }).catch(function(){ document.getElementById('m').textContent='扫描失败，请点击 ⟳ 手动刷新'; document.getElementById('rf').style.opacity=1; });
+}
+function doScan(){ clearTimeout(polling); fetch('/startscan').then(poll).catch(poll); }
 function conn(){ var ssid=document.getElementById('ssid').value, pass=document.getElementById('pass').value, m=document.getElementById('m');
+ if(!ssid){ m.textContent='请先选择一个网络'; return; }
  m.textContent='连接中…';
- fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)})
-  .then(r=>r.json()).then(j=>{ if(j.ok){ m.innerHTML='✅ 已连接，IP: '+j.ip+'<br>正在切换数据展示页…'; setTimeout(()=>location.href='/',1500); } else m.textContent='❌ 连接失败，请检查密码'; })
-  .catch(()=>m.textContent='❌ 连接失败'); }
+ fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)})
+  .then(function(r){return r.json();}).then(function(j){ if(j.ok){ m.innerHTML='✅ 已连接，IP: '+j.ip+'<br>正在切换数据展示页…'; setTimeout(function(){location.href='/';},1500); } else m.textContent='❌ 连接失败，请检查密码'; })
+  .catch(function(){ m.textContent='❌ 连接失败'; });
+}
+window.onload=doScan;
 </script></body></html>
 )=====";
 
@@ -243,16 +268,50 @@ static void handle_root()
     server.send(200, "text/html", page);
 }
 
-static void handle_scan()
+static void start_wifi_scan()
 {
-    int n = WiFi.scanNetworks();
+    /* 异步扫描：立即返回，结果由 loop() 中的 scanComplete() 轮询获取，
+     * 避免阻塞 HTTP 处理线程导致网页“点击无反应”。 */
+    WiFi.scanNetworks(true /*async*/, true /*show_hidden*/);
+    scanState = 1;
+}
+
+static String build_scan_json()
+{
+    int n = WiFi.scanComplete();
+    /* 过滤空 SSID（隐藏网络），并按信号强度降序排序，只显示 SSID 不显示强度 */
+    int idx[32]; int cnt = 0;
+    for (int i = 0; i < n && cnt < 32; i++) {
+        if (WiFi.SSID(i).length() > 0) idx[cnt++] = i;
+    }
+    for (int a = 0; a < cnt - 1; a++)
+        for (int b = a + 1; b < cnt; b++)
+            if (WiFi.RSSI(idx[b]) > WiFi.RSSI(idx[a])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
     String json = "[";
-    for (int i = 0; i < n; i++) {
-        if (i) json += ",";
-        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    for (int k = 0; k < cnt; k++) {
+        if (k) json += ",";
+        String ssid = WiFi.SSID(idx[k]);
+        ssid.replace("\\", "\\\\");
+        ssid.replace("\"", "\\\"");
+        json += "{\"ssid\":\"" + ssid + "\"}";
     }
     json += "]";
-    server.send(200, "application/json", json);
+    WiFi.scanDelete();
+    return json;
+}
+
+static void handle_scan()
+{
+    /* 返回后台扫描状态与缓存结果（不触发新扫描，页面按需调用 /startscan） */
+    String body = "{\"scanning\":" + String(scanState == 1 ? "true" : "false") + ",\"nets\":" + lastScanJson + "}";
+    server.send(200, "application/json", body);
+}
+
+static void handle_startscan()
+{
+    /* 仅当空闲时发起一次扫描，供页面“进入即扫描一次 / 手动刷新”使用 */
+    if (scanState == 0) start_wifi_scan();
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 static void handle_connect()
@@ -348,6 +407,8 @@ static void start_cfg()
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     webMode = WEB_CONFIG;
+    lastScanJson = "[]";
+    start_wifi_scan();          /* 进入配网页即开始首次扫描 */
     if (!webActive) { server.begin(); webActive = true; }
 }
 
@@ -356,6 +417,8 @@ static void stop_all()
     webActive = false;
     server.stop();
     otaInProgress = false;
+    scanState = 0;
+    WiFi.scanDelete();
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -408,8 +471,9 @@ void setup()
     Serial.println("QiMingXing ESP AT Ready");
 
     server.on("/", HTTP_GET, handle_root);
-    server.on("/scan",   HTTP_GET,  handle_scan);
-    server.on("/connect",HTTP_POST, handle_connect);
+    server.on("/scan",      HTTP_GET,  handle_scan);
+    server.on("/startscan", HTTP_GET,  handle_startscan);
+    server.on("/connect",   HTTP_POST, handle_connect);
     server.on("/data",   HTTP_GET,  handle_data);
     server.on("/upload", HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_upload);
     /* 注意：server.begin() 延后到首条 AT+OTAAP / AT+CFGAP 才启动，
@@ -420,6 +484,14 @@ void loop()
 {
     /* OTA 转发期间，UART 上只有 ACK/NAK 字节，不应被当作指令解析 */
     if (!otaInProgress) process_uart();
+
+    /* 配网模式下后台异步扫描：仅完成进入时发起的一次扫描（不再周期重扫） */
+    if (webActive && webMode == WEB_CONFIG && scanState == 1) {
+        int n = WiFi.scanComplete();
+        if (n >= 0)      { lastScanJson = build_scan_json(); scanState = 0; }
+        else if (n == -2){ lastScanJson = "[]";               scanState = 0; }
+    }
+
     if (webActive) server.handleClient();
     yield();
 }
