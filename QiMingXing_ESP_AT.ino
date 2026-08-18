@@ -102,7 +102,8 @@ static int uart_wait_ack(int timeoutMs)
     return 0;
 }
 
-/* 阶段1 握手：ESP -> STM32: [0xAA 0x55 0x01] + [4字节固件大小 大端] */
+/* 阶段1 握手：ESP -> STM32: [0xAA 0x55 0x01] + [4字节固件大小 大端]
+ * 必须等待 STM32 回 ACK 后再发数据包，否则握手 ACK 会被后续 uart_wait_ack 误读。 */
 static void uart_send_handshake(uint32_t size)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x01,
@@ -110,6 +111,7 @@ static void uart_send_handshake(uint32_t size)
                        (uint8_t)(size >> 8),  (uint8_t)size };
     Serial.write(hdr, 7);
     Serial.flush();
+    uart_wait_ack(3000);    /* 等待 STM32 确认握手完成 */
 }
 
 /* 阶段2 数据包：ESP -> STM32: [0xAA] + [2字节序号大端] + [≤1024数据] + [2字节CRC16] + [0x55] */
