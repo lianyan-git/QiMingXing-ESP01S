@@ -16,17 +16,20 @@
 |------|------|------------|
 | `AT` | 探测 ESP 是否就绪，回 `OK` | Bootloader 上电先发 `AT` 等 `OK` |
 | `AT+OTAAP` | 开 SoftAP（`QiMingXing`/`12345678`）+ 网页上传固件；上传完成后自动按二进制协议经 UART 转发给 STM32 | Bootloader 发 `AT+OTAAP\r\n`，等 `OK\r\n` 后进入 UART 接收状态 |
-| `AT+CFGAP` | 开配网 AP；网页选周边 WiFi、输密码；连上路由器后输出 `+IP:xxx.xxx.xxx.xxx\r\n`，随后切数据展示页 | 需配网时发 `AT+CFGAP\r\n`；收到 `+IP:` 后在页面显示 IP |
+| `AT+CFGAP` | 开 AP 配网：网页选周边 WiFi、输密码；连接成功后关 AP 切 STA 模式，凭据自动存入 Flash | 需配网时发 `AT+CFGAP\r\n`；收到 `+IP:` 表示配网成功 |
+| `AT+STARTWEB` | 在 STA 模式下启动 Web 服务器（数据展示页），输出 `+IP:xxx.xxx.xxx.xxx` | 配网完成后发 `AT+STARTWEB\r\n` 开启网页 |
 | `AT+PUSHDATA=<string>` | 把要显示的数据缓存到内存，供数据展示网页每 2 秒轮询显示 | APP 运行时定时发送，如 `AT+PUSHDATA=TEMP:25.3C\r\n` |
 | `AT+OTACLOSE` | 关闭所有 Web Server，ESP 进入 Modem-Sleep 低功耗 | 固件升级完成或不需要网络时由 STM32 发送（**休眠时机由 STM32 控制，ESP 不自决**） |
 
 > 所有指令以 `\r\n` 结尾；除 `AT+PUSHDATA` 外均回 `OK\r\n` 或 `ERROR\r\n`。
 
-网页地址（手机连上 `QiMingXing` 后访问）：
-- `http://192.168.4.1/` — 随当前模式自动展示：固件上传页 / WiFi 配网页 / 实时数据页
+网页地址（配网模式连 `QiMingXing` 后访问）：
+- `http://192.168.4.1/` — 随当前模式自动展示：固件上传页 / WiFi 配网页
 - `http://192.168.4.1/data` — 返回最新 `PUSHDATA` 的 JSON（数据页轮询用）
 - `http://192.168.4.1/startscan` — 触发一次 WiFi 扫描（空闲时才发起），返回 `{"ok":true}`
 - `http://192.168.4.1/scan` — 返回扫描状态与结果：`{"scanning":<bool>,"nets":[{"ssid":"..."},...]}`；配网页进入时自动扫描一次，下拉只显示 SSID（不显示信号强度），需刷新时点页面 ⟳ 按钮触发新扫描，不再周期自动重扫
+
+配网成功后 AP 自动关闭，ESP 仅以 STA 模式接入路由器。之后通过 `AT+STARTWEB` 启动的数据展示页通过路由器分配的 IP 访问（`http://<路由器分配的IP>/`）。
 
 ---
 
@@ -77,3 +80,9 @@
 
 - **Bootloader**：`bootloader/bl_esp01s.c` 已改为上述二进制协议接收端，上电发 `AT+OTAAP` 后按协议写入外部 Flash，再拷贝到 App 分区。
 - **App（待迁移）**：当前 `module/mod_wifi_manager.c`、`module/http_server.c` 仍使用官方 stock AT 指令（CWMODE / CIPSTART / …）。烧录本自定义固件后这些指令不再存在，**App 端需改为使用 `AT+CFGAP` / `AT+PUSHDATA` 等自定义指令**（后续任务）。在 App 迁移完成前，仅 Bootloader 的 OTA 升级链路可用。
+
+### WiFi 凭据持久化
+
+WiFi 凭据由 ESP8266 SDK 的 `WiFi.persistent(true)` 机制自动存入 Flash。配网成功后，`WiFi.begin(ssid, pass)` 会将 SSID 和密码写入 Flash 末扇区。重启后 `WiFi.begin()` 无参数自动使用上次的凭据连接，无需重新配网。
+
+如需重新配网，可通过数据展示页的「重新配网」按钮清除凭据并重启 ESP，或由 STM32 发送 `AT+CFGAP` 进入配网模式。
