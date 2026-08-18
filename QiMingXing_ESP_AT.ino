@@ -22,11 +22,53 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <EEPROM.h>
 
 #define UART_BAUD   115200
 #define AP_SSID     "QiMingXing"
 #define AP_PASS     "12345678"
 #define OTA_PKT_MAX 1024
+
+/* ---- WiFi 凭据存储 (EEPROM) ---- */
+#define EEPROM_SIZE      128
+#define CRED_SSID_ADDR   0
+#define CRED_PASS_ADDR   64
+#define CRED_MAGIC_ADDR  120
+#define CRED_MAGIC_VAL   0xAA
+
+static void cred_save(const String &ssid, const String &pass)
+{
+    char buf[64] = {0};
+    EEPROM.begin(EEPROM_SIZE);
+    memset(buf, 0, 64);
+    strncpy(buf, ssid.c_str(), 63);
+    EEPROM.put(CRED_SSID_ADDR, buf);
+    memset(buf, 0, 64);
+    strncpy(buf, pass.c_str(), 63);
+    EEPROM.put(CRED_PASS_ADDR, buf);
+    EEPROM.write(CRED_MAGIC_ADDR, CRED_MAGIC_VAL);
+    EEPROM.commit();
+    EEPROM.end();
+}
+
+static bool cred_load(String &ssid, String &pass)
+{
+    EEPROM.begin(EEPROM_SIZE);
+    if (EEPROM.read(CRED_MAGIC_ADDR) != CRED_MAGIC_VAL) { EEPROM.end(); return false; }
+    char buf[64];
+    EEPROM.get(CRED_SSID_ADDR, buf); ssid = String(buf);
+    EEPROM.get(CRED_PASS_ADDR, buf); pass = String(buf);
+    EEPROM.end();
+    return (ssid.length() > 0);
+}
+
+static void cred_clear(void)
+{
+    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.write(CRED_MAGIC_ADDR, 0);
+    EEPROM.commit();
+    EEPROM.end();
+}
 
 ESP8266WebServer server(80);
 
@@ -270,9 +312,12 @@ function render(s){ var grid=document.getElementById('grid'), txt=document.getEl
  lines.forEach(function(ln){ var i=ln.indexOf(':'); if(i>0){ var k=ln.slice(0,i).trim(), v=ln.slice(i+1).trim();
    cards+='<div class=c><div class=k>'+esc(k)+'</div><div class=v>'+esc(v)+'</div></div>'; } });
  grid.innerHTML=cards; txt.textContent=s; }
+function reconfig(){ if(confirm('确认重新配网？')){ fetch('/reconfig',{method:'POST'}).then(function(){ alert('已清除WiFi设置，设备将重启进入配网模式'); }); } }
 setInterval(function(){ fetch('/data').then(r=>r.json()).then(j=>render(j.data)).catch(function(){}); },2000);
 fetch('/data').then(r=>r.json()).then(j=>render(j.data)).catch(function(){});
-</script></body></html>
+</script>
+<div style="text-align:center;margin-top:22px"><button onclick="reconfig()" style="background:#3b6cff;color:#fff;border:0;border-radius:10px;padding:10px 20px;font-size:14px;cursor:pointer">重新配网</button></div>
+</body></html>
 )=====";
 
 /* ===================== 网页处理 ===================== */
@@ -342,6 +387,7 @@ static void handle_connect()
         delay(500); yield();
     }
     if (ok) {
+        cred_save(ssid, pass);                    /* 存储凭据到 EEPROM */
         stationIP = WiFi.localIP().toString();
         Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
         webMode = WEB_DASH;
@@ -349,6 +395,15 @@ static void handle_connect()
     } else {
         server.send(200, "application/json", "{\"ok\":false}");
     }
+}
+
+static void handle_reconfig()
+{
+    cred_clear();
+    WiFi.disconnect(true);
+    server.send(200, "application/json", "{\"ok\":true}");
+    delay(500);
+    ESP.restart();
 }
 
 static void handle_data()
@@ -431,11 +486,28 @@ static void start_ota()
 
 static void start_cfg()
 {
+    /* 优先尝试存储的 WiFi 凭据自动连接 */
+    String savedSSID, savedPass;
+    if (cred_load(savedSSID, savedPass) && savedSSID.length() > 0) {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+        for (int t = 0; t < 30; t++) {
+            if (WiFi.status() == WL_CONNECTED) {
+                stationIP = WiFi.localIP().toString();
+                Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
+                webMode = WEB_DASH;
+                if (!webActive) { server.begin(); webActive = true; }
+                return;
+            }
+            delay(500); yield();
+        }
+    }
+    /* 自动连接失败或没有凭据 → 开 AP 配网 */
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     webMode = WEB_CONFIG;
     lastScanJson = "[]";
-    start_wifi_scan();          /* 进入配网页即开始首次扫描 */
+    start_wifi_scan();
     if (!webActive) { server.begin(); webActive = true; }
 }
 
@@ -501,8 +573,9 @@ void setup()
     server.on("/scan",      HTTP_GET,  handle_scan);
     server.on("/startscan", HTTP_GET,  handle_startscan);
     server.on("/connect",   HTTP_POST, handle_connect);
-    server.on("/data",   HTTP_GET,  handle_data);
-    server.on("/upload", HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_upload);
+    server.on("/data",     HTTP_GET,  handle_data);
+    server.on("/reconfig", HTTP_POST, handle_reconfig);
+    server.on("/upload",   HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_upload);
     /* 注意：server.begin() 延后到首条 AT+OTAAP / AT+CFGAP 才启动，
      * 这样上电后 ESP 默认低功耗、未起 AP，符合“按需开启”的设计。 */
 }
