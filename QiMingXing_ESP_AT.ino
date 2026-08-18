@@ -47,6 +47,7 @@ uint32_t otaTotal      = 0;
 uint32_t otaRecv       = 0;
 uint16_t otaSeq        = 0;
 uint32_t otaCrc        = 0xFFFFFFFF;   /* 运行中的 CRC32（最终取反） */
+uint32_t otaExpCrc     = 0;           /* 浏览器上报的原始文件 CRC32（用于拦住 WiFi 丢包污染） */
 uint8_t  otaBuf[2048];
 uint16_t otaBufLen     = 0;
 uint32_t otaPktCount   = 0;
@@ -161,16 +162,32 @@ static const char OTA_PAGE[] PROGMEM = R"=====(
  <div class=msg id=m></div>
 </div>
 <script>
+function crc32(arr){
+ var crc=0xFFFFFFFF;
+ for(var i=0;i<arr.length;i++){
+  crc^=arr[i];
+  for(var j=0;j<8;j++) crc=(crc&1)?(crc>>>1^0xEDB88320):(crc>>>1);
+ }
+ return (crc^0xFFFFFFFF)>>>0;
+}
 function up(){
  var f=document.getElementById('f'); if(!f.files[0]){alert('请先选择固件');return;}
  var file=f.files[0], btn=document.getElementById('b'), bar=document.getElementById('bar'), fill=bar.firstChild, m=document.getElementById('m');
- btn.disabled=true; bar.style.display='block'; m.textContent='正在上传…';
- var fd=new FormData(); fd.append('file',file);
- var x=new XMLHttpRequest();
- x.upload.onprogress=function(e){ if(e.total){ fill.style.width=(e.loaded*100/e.total)+'%'; } };
- x.onload=function(){ m.textContent='✅ 上传完成，已转发给主控'; btn.disabled=false; };
- x.onerror=function(){ m.textContent='❌ 上传失败，请重试'; btn.disabled=false; };
- x.open('POST','/upload?size='+file.size,true); x.send(fd);
+ btn.disabled=true; bar.style.display='block'; m.textContent='校验文件中…';
+ var reader=new FileReader();
+ reader.onload=function(){
+  var buf=new Uint8Array(reader.result);
+  var crc=crc32(buf);
+  m.textContent='正在上传…';
+  var fd=new FormData(); fd.append('file',file);
+  var x=new XMLHttpRequest();
+  x.upload.onprogress=function(e){ if(e.total){ fill.style.width=(e.loaded*100/e.total)+'%'; } };
+  x.onload=function(){ if(x.status==200){ m.textContent='✅ 上传完成，已转发给主控'; } else { m.textContent='❌ 校验失败('+x.status+')，请重试'; } btn.disabled=false; };
+  x.onerror=function(){ m.textContent='❌ 上传失败，请重试'; btn.disabled=false; };
+  x.open('POST','/upload?size='+file.size+'&crc='+crc.toString(16),true); x.send(fd);
+ };
+ reader.onerror=function(){ m.textContent='❌ 读取文件失败'; btn.disabled=false; };
+ reader.readAsArrayBuffer(file);
 }
 </script></body></html>
 )=====";
@@ -354,6 +371,7 @@ static void handle_upload()
     if (up.status == UPLOAD_FILE_START) {
         String s = server.arg("size");
         otaTotal  = s.toInt();
+        otaExpCrc = strtoul(server.arg("crc").c_str(), NULL, 16);  /* 浏览器上报的原始文件 CRC32 */
         otaPktCount = (otaTotal + (OTA_PKT_MAX - 1)) / OTA_PKT_MAX;
         otaRecv   = 0;
         otaSeq    = 0;
@@ -383,6 +401,15 @@ static void handle_upload()
         }
         /* 阶段3：总 CRC32 */
         uint32_t finalCrc = ~otaCrc;
+        if (server.arg("crc").length() > 0 && finalCrc != otaExpCrc) {
+            /* WiFi 上传链路污染：收到文件的 CRC 与浏览器上报不一致。
+             * 拒绝转发，避免把坏固件传给 STM32 导致其“下载成功”却黑屏。
+             * 浏览器会显示失败，用户重试即可（TCP 节流保证重试通常能成功）。 */
+            otaInProgress = false;
+            webMode = WEB_OTA;
+            server.send(400, "text/plain", "FIRMWARE CRC MISMATCH");
+            return;
+        }
         uart_send_end(finalCrc);
         /* 阶段4：传输结束 */
         Serial.write(0xDD);
