@@ -12,63 +12,26 @@
  *   AT                -> 回复 OK（供 STM32 探测 ESP 是否就绪）
  *   AT+OTAAP          -> 开启 SoftAP(QiMingXing/12345678) + 网页上传固件，
  *                        上传完成后自动按二进制协议经 UART 转发给 STM32
- *   AT+CFGAP          -> 开启配网 AP + 网页选择周边 WiFi，连上路由器后
- *                        经 UART 输出 "+IP:xxx.xxx.xxx.xxx"，随后切数据展示页
+ *   AT+CFGAP          -> 开 AP 配网：网页选择 WiFi，连接后关 AP 切 STA，
+ *                        凭据自动存入 ESP Flash（下次重启自动重连）
+ *   AT+STARTWEB       -> 在 STA 模式下启动 Web 服务器（数据展示页），
+ *                        输出 "+IP:xxx.xxx.xxx.xxx"
  *   AT+PUSHDATA=<str> -> 缓存数据，数据展示网页每 2 秒轮询显示最新内容
  *   AT+OTACLOSE       -> 关闭 Web Server，ESP 进入 Modem-Sleep 低功耗
+ *
+ * WiFi 凭据由 ESP8266 SDK 自动持久化（WiFi.persistent），
+ * 无需 EEPROM，重启后 WiFi.begin() 自动使用上次的 SSID/密码。
  *
  * OTA 串口协议（1KB/包，包级 ACK）见 README 与下方常量说明。
  *************************************************************/
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <EEPROM.h>
 
 #define UART_BAUD   115200
 #define AP_SSID     "QiMingXing"
 #define AP_PASS     "12345678"
 #define OTA_PKT_MAX 1024
-
-/* ---- WiFi 凭据存储 (EEPROM) ---- */
-#define EEPROM_SIZE      128
-#define CRED_SSID_ADDR   0
-#define CRED_PASS_ADDR   64
-#define CRED_MAGIC_ADDR  120
-#define CRED_MAGIC_VAL   0xAA
-
-static void cred_save(const String &ssid, const String &pass)
-{
-    char buf[64] = {0};
-    EEPROM.begin(EEPROM_SIZE);
-    memset(buf, 0, 64);
-    strncpy(buf, ssid.c_str(), 63);
-    EEPROM.put(CRED_SSID_ADDR, buf);
-    memset(buf, 0, 64);
-    strncpy(buf, pass.c_str(), 63);
-    EEPROM.put(CRED_PASS_ADDR, buf);
-    EEPROM.write(CRED_MAGIC_ADDR, CRED_MAGIC_VAL);
-    EEPROM.commit();
-    EEPROM.end();
-}
-
-static bool cred_load(String &ssid, String &pass)
-{
-    EEPROM.begin(EEPROM_SIZE);
-    if (EEPROM.read(CRED_MAGIC_ADDR) != CRED_MAGIC_VAL) { EEPROM.end(); return false; }
-    char buf[64];
-    EEPROM.get(CRED_SSID_ADDR, buf); ssid = String(buf);
-    EEPROM.get(CRED_PASS_ADDR, buf); pass = String(buf);
-    EEPROM.end();
-    return (ssid.length() > 0);
-}
-
-static void cred_clear(void)
-{
-    EEPROM.begin(EEPROM_SIZE);
-    EEPROM.write(CRED_MAGIC_ADDR, 0);
-    EEPROM.commit();
-    EEPROM.end();
-}
 
 ESP8266WebServer server(80);
 
@@ -281,7 +244,7 @@ function conn(){ var ssid=document.getElementById('ssid').value, pass=document.g
  if(!ssid){ m.textContent='请先选择一个网络'; return; }
  m.textContent='连接中…';
  fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)})
-  .then(function(r){return r.json();}).then(function(j){ if(j.ok){ m.innerHTML='✅ 已连接，IP: '+j.ip+'<br>正在切换数据展示页…'; setTimeout(function(){location.href='/';},1500); } else m.textContent='❌ 连接失败，请检查密码'; })
+  .then(function(r){return r.json();}).then(function(j){ if(j.ok){ m.innerHTML='✅ 已连接<span id=ip>'+j.ip+'</span><br>AP 即将关闭，请刷新页面使用新 IP 访问'; } else m.textContent='❌ 连接失败，请检查密码'; })
   .catch(function(){ m.textContent='❌ 连接失败'; });
 }
 window.onload=doScan;
@@ -332,8 +295,6 @@ static void handle_root()
 
 static void start_wifi_scan()
 {
-    /* 异步扫描：立即返回，结果由 loop() 中的 scanComplete() 轮询获取，
-     * 避免阻塞 HTTP 处理线程导致网页“点击无反应”。 */
     WiFi.scanNetworks(true /*async*/, true /*show_hidden*/);
     scanState = 1;
 }
@@ -341,7 +302,6 @@ static void start_wifi_scan()
 static String build_scan_json()
 {
     int n = WiFi.scanComplete();
-    /* 过滤空 SSID（隐藏网络），并按信号强度降序排序，只显示 SSID 不显示强度 */
     int idx[32]; int cnt = 0;
     for (int i = 0; i < n && cnt < 32; i++) {
         if (WiFi.SSID(i).length() > 0) idx[cnt++] = i;
@@ -364,14 +324,12 @@ static String build_scan_json()
 
 static void handle_scan()
 {
-    /* 返回后台扫描状态与缓存结果（不触发新扫描，页面按需调用 /startscan） */
     String body = "{\"scanning\":" + String(scanState == 1 ? "true" : "false") + ",\"nets\":" + lastScanJson + "}";
     server.send(200, "application/json", body);
 }
 
 static void handle_startscan()
 {
-    /* 仅当空闲时发起一次扫描，供页面“进入即扫描一次 / 手动刷新”使用 */
     if (scanState == 0) start_wifi_scan();
     server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -380,6 +338,7 @@ static void handle_connect()
 {
     String ssid = server.arg("ssid");
     String pass = server.arg("pass");
+    WiFi.persistent(true);
     WiFi.begin(ssid.c_str(), pass.c_str());
     bool ok = false;
     for (int t = 0; t < 30; t++) {
@@ -387,9 +346,11 @@ static void handle_connect()
         delay(500); yield();
     }
     if (ok) {
-        cred_save(ssid, pass);                    /* 存储凭据到 EEPROM */
         stationIP = WiFi.localIP().toString();
         Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
+        /* 关闭 AP 模式，ESP 仅作为 STA 设备接入路由器 */
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
         webMode = WEB_DASH;
         server.send(200, "application/json", "{\"ok\":true,\"ip\":\"" + stationIP + "\"}");
     } else {
@@ -399,7 +360,7 @@ static void handle_connect()
 
 static void handle_reconfig()
 {
-    cred_clear();
+    WiFi.persistent(true);
     WiFi.disconnect(true);
     server.send(200, "application/json", "{\"ok\":true}");
     delay(500);
@@ -408,7 +369,6 @@ static void handle_reconfig()
 
 static void handle_data()
 {
-    /* 转义后放入 JSON 字符串：反斜杠/双引号/换行 */
     String s = lastData;
     s.replace("\\", "\\\\");
     s.replace("\"", "\\\"");
@@ -426,14 +386,13 @@ static void handle_upload()
     if (up.status == UPLOAD_FILE_START) {
         String s = server.arg("size");
         otaTotal  = s.toInt();
-        otaExpCrc = strtoul(server.arg("crc").c_str(), NULL, 16);  /* 浏览器上报的原始文件 CRC32 */
+        otaExpCrc = strtoul(server.arg("crc").c_str(), NULL, 16);
         otaPktCount = (otaTotal + (OTA_PKT_MAX - 1)) / OTA_PKT_MAX;
         otaRecv   = 0;
         otaSeq    = 0;
         otaCrc    = 0xFFFFFFFF;
         otaBufLen = 0;
         otaInProgress = true;
-        /* 阶段1：握手，告知 STM32 固件大小 */
         uart_send_handshake(otaTotal);
     }
     else if (up.status == UPLOAD_FILE_WRITE) {
@@ -454,23 +413,18 @@ static void handle_upload()
             uart_send_packet(otaSeq++, otaBuf, otaBufLen);
             otaBufLen = 0;
         }
-        /* 阶段3：总 CRC32 */
         uint32_t finalCrc = ~otaCrc;
         if (server.arg("crc").length() > 0 && finalCrc != otaExpCrc) {
-            /* WiFi 上传链路污染：收到文件的 CRC 与浏览器上报不一致。
-             * 拒绝转发，避免把坏固件传给 STM32 导致其“下载成功”却黑屏。
-             * 浏览器会显示失败，用户重试即可（TCP 节流保证重试通常能成功）。 */
             otaInProgress = false;
             webMode = WEB_OTA;
             server.send(400, "text/plain", "FIRMWARE CRC MISMATCH");
             return;
         }
         uart_send_end(finalCrc);
-        /* 阶段4：传输结束 */
         Serial.write(0xDD);
         Serial.flush();
         otaInProgress = false;
-        webMode = WEB_DASH;   /* 上传完成后切换为数据展示页 */
+        webMode = WEB_DASH;
         server.send(200, "text/plain", "OK");
     }
 }
@@ -486,29 +440,46 @@ static void start_ota()
 
 static void start_cfg()
 {
-    /* 优先尝试存储的 WiFi 凭据自动连接 */
-    String savedSSID, savedPass;
-    if (cred_load(savedSSID, savedPass) && savedSSID.length() > 0) {
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(savedSSID.c_str(), savedPass.c_str());
-        for (int t = 0; t < 30; t++) {
-            if (WiFi.status() == WL_CONNECTED) {
-                stationIP = WiFi.localIP().toString();
-                Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
-                webMode = WEB_DASH;
-                if (!webActive) { server.begin(); webActive = true; }
-                return;
-            }
-            delay(500); yield();
+    /* 先尝试用 SDK 自动存储的凭据连接（WiFi.persistent 自动保存） */
+    WiFi.persistent(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    for (int t = 0; t < 20; t++) {
+        if (WiFi.status() == WL_CONNECTED) {
+            stationIP = WiFi.localIP().toString();
+            Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
+            webMode = WEB_DASH;
+            if (!webActive) { server.begin(); webActive = true; }
+            return;
         }
+        delay(500); yield();
     }
-    /* 自动连接失败或没有凭据 → 开 AP 配网 */
+
+    /* 自动连接失败 → 开 AP 配网 */
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     webMode = WEB_CONFIG;
     lastScanJson = "[]";
     start_wifi_scan();
     if (!webActive) { server.begin(); webActive = true; }
+}
+
+static void start_web()
+{
+    /* 在 STA 模式下启动 Web 服务器，输出 IP 供 STM32 使用 */
+    WiFi.mode(WIFI_STA);
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.persistent(true);
+        WiFi.begin();
+        for (int t = 0; t < 20; t++) {
+            if (WiFi.status() == WL_CONNECTED) break;
+            delay(500); yield();
+        }
+    }
+    stationIP = WiFi.localIP().toString();
+    webMode = WEB_DASH;
+    if (!webActive) { server.begin(); webActive = true; }
+    Serial.print("+IP:"); Serial.print(stationIP); Serial.print("\r\n");
 }
 
 static void stop_all()
@@ -521,7 +492,7 @@ static void stop_all()
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    WiFi.forceSleepBegin();   /* Modem-Sleep 低功耗 */
+    WiFi.forceSleepBegin();
 }
 
 static void handle_at(const String &cmd)
@@ -537,8 +508,12 @@ static void handle_at(const String &cmd)
         start_cfg();
         Serial.println("OK");
     }
+    else if (cmd == "AT+STARTWEB") {
+        start_web();
+        Serial.println("OK");
+    }
     else if (cmd.startsWith("AT+PUSHDATA=")) {
-        lastData = cmd.substring(12);   /* "AT+PUSHDATA=" 共 12 字符，数据从索引 12 开始 */
+        lastData = cmd.substring(12);
         Serial.println("OK");
     }
     else if (cmd == "AT+OTACLOSE") {
@@ -576,16 +551,12 @@ void setup()
     server.on("/data",     HTTP_GET,  handle_data);
     server.on("/reconfig", HTTP_POST, handle_reconfig);
     server.on("/upload",   HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_upload);
-    /* 注意：server.begin() 延后到首条 AT+OTAAP / AT+CFGAP 才启动，
-     * 这样上电后 ESP 默认低功耗、未起 AP，符合“按需开启”的设计。 */
 }
 
 void loop()
 {
-    /* OTA 转发期间，UART 上只有 ACK/NAK 字节，不应被当作指令解析 */
     if (!otaInProgress) process_uart();
 
-    /* 配网模式下后台异步扫描：仅完成进入时发起的一次扫描（不再周期重扫） */
     if (webActive && webMode == WEB_CONFIG && scanState == 1) {
         int n = WiFi.scanComplete();
         if (n >= 0)      { lastScanJson = build_scan_json(); scanState = 0; }
