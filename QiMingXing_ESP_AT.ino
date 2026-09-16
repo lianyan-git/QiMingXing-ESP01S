@@ -32,6 +32,7 @@
 #define AP_SSID     "QIMINGXING"
 #define AP_PASS     "12345678"
 #define OTA_PKT_MAX 1024
+#define LANG_PKT_MAX 1024
 #define WS_PORT     81
 
 #define CFG_MAX     5
@@ -42,7 +43,7 @@
 ESP8266WebServer server(80);
 WebSocketsServer ws(WS_PORT);
 
-enum WebMode { WEB_OTA, WEB_CONFIG, WEB_DASH, WEB_MUSIC };
+enum WebMode { WEB_OTA, WEB_CONFIG, WEB_DASH, WEB_MUSIC, WEB_LANG };
 WebMode webMode = WEB_OTA;
 bool    webActive = false;
 
@@ -171,13 +172,38 @@ static void uart_music_handshake(uint32_t size)
     for (int a = 0; a < 5; a++) {
         Serial.write(hdr, 7);
         Serial.flush();
-        if (uart_wait_ack(3000) == 1) return;
+        if (uart_wait_ack(10000)   /* 同 OTA: 等 STM32 擦净分区后的 ACK */ == 1) return;
     }
 }
 
 static void uart_music_end(uint32_t crc)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x12,
+                       (uint8_t)(crc >> 24), (uint8_t)(crc >> 16),
+                       (uint8_t)(crc >> 8),  (uint8_t)crc };
+    for (int a = 0; a < 5; a++) {
+        Serial.write(hdr, 7);
+        Serial.flush();
+        if (uart_wait_ack(3000) == 1) return;
+    }
+}
+
+/* 语言字库帧：握手 0x13 / 结束 0x14（与 OTA 0x01/0x02、音乐 0x11/0x12 区分） */
+static void uart_lang_handshake(uint32_t size)
+{
+    uint8_t hdr[7] = { 0xAA, 0x55, 0x13,
+                       (uint8_t)(size >> 24), (uint8_t)(size >> 16),
+                       (uint8_t)(size >> 8),  (uint8_t)size };
+    for (int a = 0; a < 5; a++) {
+        Serial.write(hdr, 7);
+        Serial.flush();
+        if (uart_wait_ack(30000) == 1) return;   /* 等 STM32 预擦整段字库(10-20s) */
+    }
+}
+
+static void uart_lang_end(uint32_t crc)
+{
+    uint8_t hdr[7] = { 0xAA, 0x55, 0x14,
                        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16),
                        (uint8_t)(crc >> 8),  (uint8_t)crc };
     for (int a = 0; a < 5; a++) {
@@ -550,6 +576,48 @@ b.onclick=function(){
 </script></body></html>
 )=====";
 
+/* 语言字库上传页（AP 模式服务，铺包格式 .bin） */
+static const char LANG_PAGE[] PROGMEM = R"=====(
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Language Load</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:"PingFang SC","Microsoft YaHei",-apple-system,Helvetica,Arial,sans-serif;background:linear-gradient(160deg,#12141f 0%,#1c1f35 45%,#241b3a 100%);padding:16px;color:#eef1ff}
+.card{width:100%;max-width:420px;background:rgba(30,34,58,.72);border:1px solid rgba(255,255,255,.10);border-radius:20px;padding:28px 24px 24px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+.top{display:flex;align-items:center;gap:12px;margin-bottom:6px}
+.note{width:46px;height:46px;border-radius:14px;flex:none;background:linear-gradient(135deg,#0ea5e9,#22d3ee);display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff}
+h1{font-size:19px;font-weight:600}
+.sub{color:#9aa0c6;font-size:12px;line-height:1.6;margin:2px 0 18px}
+.drop{border:2px dashed rgba(255,255,255,.22);border-radius:14px;padding:26px 14px;text-align:center;cursor:pointer;background:rgba(255,255,255,.03)}
+.drop.over{border-color:#38bdf8;background:rgba(56,189,248,.08)}
+.drop .big{font-size:13px;color:#dfe3ff}.drop .small{font-size:11px;color:#7c82a8;margin-top:6px}
+.file{display:none;margin-top:14px;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,.06);font-size:12px;color:#dfe3ff;word-break:break-all}
+.ctrl{display:none;margin-top:18px}
+button{width:100%;padding:14px;border:0;border-radius:12px;font-size:15px;font-weight:600;color:#fff;cursor:pointer;background:linear-gradient(135deg,#0ea5e9,#7c3aed);box-shadow:0 8px 20px rgba(14,165,233,.35)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.barbox{margin-top:16px;display:none}.bar{height:10px;border-radius:6px;background:rgba(255,255,255,.10);overflow:hidden}.bar>i{display:block;height:100%;width:0%;background:linear-gradient(90deg,#0ea5e9,#22d3ee);transition:width .25s}
+.pct{text-align:right;font-size:11px;color:#9aa0c6;margin-top:6px}
+#st{margin-top:16px;font-size:13px;text-align:center;min-height:18px}
+#st.ok{color:#34d399}#st.err{color:#fb7185}#st.wait{color:#fbbf24}
+</style></head><body>
+<div class="card"><div class="top"><div class="note">&#65;</div><div><h1>Language load</h1><div class="sub">部署完整中文字库，完成后自动关闭热点</div></div></div>
+<div class="drop" id="dz"><div class="big">点击选择 或 拖入 字库文件</div><div class="small">支持 font_lang.bin · 约 686 KB</div></div>
+<input type="file" id="f" accept=".bin" hidden>
+<div class="file" id="fd"></div>
+<div class="ctrl" id="cw"><button id="b">开始上传</button></div>
+<div class="barbox" id="bb"><div class="bar"><i id="pb"></i></div><div class="pct" id="pc">0%</div></div>
+<div id="st"></div></div>
+<script>
+var dz=document.getElementById('dz'),f=document.getElementById('f'),fd=document.getElementById('fd'),cw=document.getElementById('cw'),b=document.getElementById('b'),bb=document.getElementById('bb'),pb=document.getElementById('pb'),pc=document.getElementById('pc'),st=document.getElementById('st'),sel=null;
+dz.onclick=function(){f.click()};
+dz.ondragover=function(e){e.preventDefault();dz.classList.add('over')};
+dz.ondragleave=function(){dz.classList.remove('over')};
+dz.ondrop=function(e){e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files.length)f.files=e.dataTransfer.files;show();};
+f.onchange=show;
+function show(){var s=f.files[0];if(!s)return;if(s.name.indexOf('.bin')<0){st.className='err';st.textContent='请选择 .bin 字库文件';sel=null;return;}sel=s;fd.textContent='已选择　'+s.name+'　·　'+(s.size/1024).toFixed(1)+' KB';fd.style.display='block';cw.style.display='block';st.textContent='';st.className='';}
+b.onclick=function(){if(!sel)return;b.disabled=true;st.className='wait';st.textContent='正在上传，请保持本页打开…';bb.style.display='block';pb.style.width='0%';pc.textContent='0%';var x=new XMLHttpRequest();var fmd=new FormData();fmd.append('file',sel);x.open('POST','/lang?size='+sel.size,true);x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded*100/e.total);pb.style.width=p+'%';pc.textContent=p+'%';}};x.onload=function(){pb.style.width='100%';pc.textContent='100%';if(x.status==200){st.className='ok';st.textContent='上传完成，正在写入并关闭热点…';}else{st.className='err';st.textContent='上传失败（'+x.status+'），请重试';b.disabled=false;}};x.onerror=function(){st.className='err';st.textContent='网络错误，请重试';b.disabled=false;};x.send(fmd);};
+</script></body></html>
+)=====";
+
 /* ===================== 网页处理 ===================== */
 static void handle_root()
 {
@@ -563,6 +631,10 @@ static void handle_root()
     }
     if (webMode == WEB_MUSIC) {
         server.send(200, "text/html", FPSTR(MUSIC_PAGE));
+        return;
+    }
+    if (webMode == WEB_LANG) {
+        server.send(200, "text/html", FPSTR(LANG_PAGE));
         return;
     }
     /* DASH：分块发送 43KB 仪表盘（PROGMEM，避免整串拷贝 RAM） */
@@ -768,6 +840,7 @@ static void handle_upload()
  * AT+MUSICCLOSE：关闭音乐 AP（不关 STA）。 */
 
 bool    musicInProgress = false;
+uint32_t langTotal = 0;
 
 /* 音乐上传 AP：采用原厂 AT+CWMODE=3 的 AP+STA 共存模式。
  * ESP8266 单射频时分复用：softAP 不指定信道，SDK 自动跟随 STA 当前信道，
@@ -822,6 +895,74 @@ static void close_music_ap()
         server.stop();
     }
     Serial.print("+MUSICCLOSED\r\n");
+}
+
+bool    langInProgress = false;
+bool    lang_sta_was_up = false;
+
+static void start_lang_ap()
+{
+    lang_sta_was_up = (WiFi.status() == WL_CONNECTED);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    if (lang_sta_was_up && WiFi.status() != WL_CONNECTED) {
+        for (int i = 0; i < CFG_MAX; i++) {
+            if (s_cfg_valid[i] && s_cfg[i].ssid[0]) { WiFi.begin(s_cfg[i].ssid, s_cfg[i].pass); break; }
+        }
+    }
+    webMode = WEB_LANG;
+    if (!webActive) { server.begin(); webActive = true; }
+    Serial.print("+LANGAP\r\n");
+}
+
+static void close_lang_ap()
+{
+    bool need_sta = lang_sta_was_up;
+    WiFi.softAPdisconnect(true);
+    if (need_sta) {
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.mode(WIFI_STA);
+            WiFi.disconnect(false);
+            for (int i = 0; i < CFG_MAX; i++) {
+                if (s_cfg_valid[i] && s_cfg[i].ssid[0]) { WiFi.begin(s_cfg[i].ssid, s_cfg[i].pass); break; }
+            }
+        }
+        lang_sta_was_up = false;
+        webMode = WEB_DASH;
+        if (!webActive) { server.begin(); webActive = true; }
+    } else {
+        WiFi.mode(WIFI_OFF); WiFi.forceSleepBegin(); webActive = false; server.stop();
+    }
+    Serial.print("+LANGCLOSED\r\n");
+}
+
+static void handle_lang_upload()
+{
+    HTTPUpload &up = server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        String s = server.arg("size");
+        langTotal = s.toInt();
+        otaRecv   = 0; otaSeq = 0; otaCrc = 0xFFFFFFFF; otaBufLen = 0;
+        langInProgress = true;
+        uart_lang_handshake(langTotal);
+    }
+    else if (up.status == UPLOAD_FILE_WRITE) {
+        const uint8_t *d = up.buf; size_t n = up.currentSize;
+        for (size_t i = 0; i < n; i++) {
+            otaBuf[otaBufLen++] = d[i];
+            otaCrc = ota_crc32_upd(otaCrc, d[i]);
+            otaRecv++;
+            if (otaBufLen >= LANG_PKT_MAX) { uart_send_packet(otaSeq++, otaBuf, LANG_PKT_MAX); otaBufLen = 0; }
+        }
+    }
+    else if (up.status == UPLOAD_FILE_END) {
+        if (otaBufLen > 0) { uart_send_packet(otaSeq++, otaBuf, otaBufLen); otaBufLen = 0; }
+        uint32_t finalCrc = ~otaCrc;
+        uart_lang_end(finalCrc);
+        langInProgress = false;
+        if (otaRecv == langTotal) { Serial.print("+LANGOK\r\n"); server.send(200, "text/plain", "OK"); close_lang_ap(); }
+        else { Serial.print("+LANGERR\r\n"); server.send(400, "text/plain", "LANG CRC FAIL"); }
+    }
 }
 
 static void handle_music_upload()
@@ -979,8 +1120,15 @@ static void handle_at(const String &cmd)
         start_music_ap();
         Serial.println("OK");
     }
+    else if (cmd == "AT+LANGAP") {
+        start_lang_ap();
+        Serial.println("OK");
+    }
     else if (cmd == "AT+MUSICCLOSE") {
         close_music_ap();
+    }
+    else if (cmd == "AT+LANGCLOSE") {
+        close_lang_ap();
     }
     else if (cmd == "AT+WEBCLOSE") {
         stop_all();
@@ -1041,6 +1189,7 @@ void setup()
     server.on("/reconfig", HTTP_POST, handle_reconfig);
     server.on("/upload",   HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_upload);
     server.on("/music",    HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_music_upload);
+    server.on("/lang",     HTTP_POST, []() { server.send(200, "text/plain", "OK"); }, handle_lang_upload);
 
     ws.begin();
     ws.onEvent(wsEvent);
