@@ -127,17 +127,17 @@ static int uart_wait_ack(int timeoutMs)
     return 0;
 }
 
-static void uart_send_handshake(uint32_t size)
+static bool uart_send_handshake(uint32_t size)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x01,
                        (uint8_t)(size >> 24), (uint8_t)(size >> 16),
                        (uint8_t)(size >> 8),  (uint8_t)size };
     Serial.write(hdr, 7);
     Serial.flush();
-    uart_wait_ack(10000);
+    return uart_wait_ack(10000) == 1;
 }
 
-static void uart_send_packet(uint16_t seq, const uint8_t *data, uint16_t len)
+static bool uart_send_packet(uint16_t seq, const uint8_t *data, uint16_t len)
 {
     for (int attempt = 0; attempt < 5; attempt++) {
         uint8_t hdr[3] = { 0xAA, (uint8_t)(seq >> 8), (uint8_t)(seq & 0xFF) };
@@ -149,22 +149,26 @@ static void uart_send_packet(uint16_t seq, const uint8_t *data, uint16_t len)
         Serial.write(0x55);
         Serial.flush();
         int r = uart_wait_ack(3000);
-        if (r == 1) return;
+        if (r == 1) return true;
+        if (r == 0) { /* 无应答: 重试同序号 */ }
+        /* NAK(r==-1): STM32 已要求重传, 直接重试 */
     }
+    return false;   /* 5 次均失败: 上传链路已断, 调用方必须停止发送 */
 }
 
-static void uart_send_end(uint32_t crc)
+static bool uart_send_end(uint32_t crc)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x02,
                        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16),
                        (uint8_t)(crc >> 8),  (uint8_t)crc };
     Serial.write(hdr, 7);
     Serial.flush();
-    uart_wait_ack(3000);
+    return uart_wait_ack(3000) == 1;
 }
 
-/* 音乐帧：握手 0x11 / 结束 0x12（与 OTA 帧 0x01/0x02 区分，App 端音乐接收器识别） */
-static void uart_music_handshake(uint32_t size)
+/* 音乐帧：握手 0x11 / 结束 0x12（与 OTA 帧 0x01/0x02 区分，App 端音乐接收器识别）
+ * 全部返回 bool：false=重试 5 次仍无 ACK，上层必须终止上传，禁止继续往后发 */
+static bool uart_music_handshake(uint32_t size)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x11,
                        (uint8_t)(size >> 24), (uint8_t)(size >> 16),
@@ -172,11 +176,12 @@ static void uart_music_handshake(uint32_t size)
     for (int a = 0; a < 5; a++) {
         Serial.write(hdr, 7);
         Serial.flush();
-        if (uart_wait_ack(10000)   /* 同 OTA: 等 STM32 擦净分区后的 ACK */ == 1) return;
+        if (uart_wait_ack(10000)   /* 同 OTA: 等 STM32 擦净分区后的 ACK */ == 1) return true;
     }
+    return false;
 }
 
-static void uart_music_end(uint32_t crc)
+static bool uart_music_end(uint32_t crc)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x12,
                        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16),
@@ -184,12 +189,13 @@ static void uart_music_end(uint32_t crc)
     for (int a = 0; a < 5; a++) {
         Serial.write(hdr, 7);
         Serial.flush();
-        if (uart_wait_ack(3000) == 1) return;
+        if (uart_wait_ack(3000) == 1) return true;
     }
+    return false;
 }
 
 /* 语言字库帧：握手 0x13 / 结束 0x14（与 OTA 0x01/0x02、音乐 0x11/0x12 区分） */
-static void uart_lang_handshake(uint32_t size)
+static bool uart_lang_handshake(uint32_t size)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x13,
                        (uint8_t)(size >> 24), (uint8_t)(size >> 16),
@@ -197,11 +203,12 @@ static void uart_lang_handshake(uint32_t size)
     for (int a = 0; a < 5; a++) {
         Serial.write(hdr, 7);
         Serial.flush();
-        if (uart_wait_ack(30000) == 1) return;   /* 等 STM32 预擦整段字库(10-20s) */
+        if (uart_wait_ack(30000) == 1) return true;   /* 等 STM32 预擦整段字库(10-20s) */
     }
+    return false;
 }
 
-static void uart_lang_end(uint32_t crc)
+static bool uart_lang_end(uint32_t crc)
 {
     uint8_t hdr[7] = { 0xAA, 0x55, 0x14,
                        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16),
@@ -209,8 +216,9 @@ static void uart_lang_end(uint32_t crc)
     for (int a = 0; a < 5; a++) {
         Serial.write(hdr, 7);
         Serial.flush();
-        if (uart_wait_ack(3000) == 1) return;
+        if (uart_wait_ack(3000) == 1) return true;
     }
+    return false;
 }
 
 /* ===================== 5 组存参读写 =====================
@@ -943,25 +951,35 @@ static void handle_lang_upload()
         String s = server.arg("size");
         langTotal = s.toInt();
         otaRecv   = 0; otaSeq = 0; otaCrc = 0xFFFFFFFF; otaBufLen = 0;
-        langInProgress = true;
-        uart_lang_handshake(langTotal);
+        langInProgress = uart_lang_handshake(langTotal);
+        if (!langInProgress) Serial.print("+LANGERR\r\n");   /* 握手失败: 后续包一律不发, 防止两边状态机失步 */
     }
     else if (up.status == UPLOAD_FILE_WRITE) {
+        if (!langInProgress) return;                    /* 已失败: 吞掉剩余文件, 不再往 UART 灌 */
         const uint8_t *d = up.buf; size_t n = up.currentSize;
         for (size_t i = 0; i < n; i++) {
             otaBuf[otaBufLen++] = d[i];
             otaCrc = ota_crc32_upd(otaCrc, d[i]);
             otaRecv++;
-            if (otaBufLen >= LANG_PKT_MAX) { uart_send_packet(otaSeq++, otaBuf, LANG_PKT_MAX); otaBufLen = 0; }
+            if (otaBufLen >= LANG_PKT_MAX) {
+                if (!uart_send_packet(otaSeq++, otaBuf, LANG_PKT_MAX)) {
+                    langInProgress = false;             /* 包级 ACK 失败: 立即停传 */
+                    Serial.print("+LANGERR\r\n");
+                    return;
+                }
+                otaBufLen = 0;
+            }
         }
     }
     else if (up.status == UPLOAD_FILE_END) {
-        if (otaBufLen > 0) { uart_send_packet(otaSeq++, otaBuf, otaBufLen); otaBufLen = 0; }
+        bool ok = langInProgress;
+        if (ok && otaBufLen > 0) ok = uart_send_packet(otaSeq++, otaBuf, otaBufLen);
+        otaBufLen = 0;
         uint32_t finalCrc = ~otaCrc;
-        uart_lang_end(finalCrc);
+        if (ok) ok = uart_lang_end(finalCrc);
         langInProgress = false;
-        if (otaRecv == langTotal) { Serial.print("+LANGOK\r\n"); server.send(200, "text/plain", "OK"); close_lang_ap(); }
-        else { Serial.print("+LANGERR\r\n"); server.send(400, "text/plain", "LANG CRC FAIL"); }
+        if (ok && otaRecv == langTotal) { Serial.print("+LANGOK\r\n"); server.send(200, "text/plain", "OK"); close_lang_ap(); }
+        else { Serial.print("+LANGERR\r\n"); server.send(400, "text/plain", "LANG UPLOAD FAIL"); }
     }
 }
 
@@ -976,10 +994,11 @@ static void handle_music_upload()
         otaSeq    = 0;
         otaCrc    = 0xFFFFFFFF;
         otaBufLen = 0;
-        musicInProgress = true;
-        uart_music_handshake(musicTotal);
+        musicInProgress = uart_music_handshake(musicTotal);
+        if (!musicInProgress) Serial.print("+MUSICERR\r\n");  /* 握手失败: 后续包一律不发 */
     }
     else if (up.status == UPLOAD_FILE_WRITE) {
+        if (!musicInProgress) return;                   /* 已失败: 不再往 UART 灌, 保持两边同步 */
         const uint8_t *d = up.buf;
         size_t n = up.currentSize;
         for (size_t i = 0; i < n; i++) {
@@ -987,26 +1006,29 @@ static void handle_music_upload()
             otaCrc = ota_crc32_upd(otaCrc, d[i]);
             otaRecv++;
             if (otaBufLen >= OTA_PKT_MAX) {
-                uart_send_packet(otaSeq++, otaBuf, OTA_PKT_MAX);
+                if (!uart_send_packet(otaSeq++, otaBuf, OTA_PKT_MAX)) {
+                    musicInProgress = false;            /* 包级 ACK 失败: 立即停传 */
+                    Serial.print("+MUSICERR\r\n");
+                    return;
+                }
                 otaBufLen = 0;
             }
         }
     }
     else if (up.status == UPLOAD_FILE_END) {
-        if (otaBufLen > 0) {
-            uart_send_packet(otaSeq++, otaBuf, otaBufLen);
-            otaBufLen = 0;
-        }
+        bool ok = musicInProgress;
+        if (ok && otaBufLen > 0) ok = uart_send_packet(otaSeq++, otaBuf, otaBufLen);
+        otaBufLen = 0;
         uint32_t finalCrc = ~otaCrc;
-        uart_music_end(finalCrc);
+        if (ok) ok = uart_music_end(finalCrc);
         musicInProgress = false;
-        if (finalCrc != 0 && otaRecv == musicTotal) {   /* 校验由 App 端完成，这里仅表示已转发 */
+        if (ok && finalCrc != 0 && otaRecv == musicTotal) {   /* 完整性校验由 App 端完成 */
             Serial.print("+MUSICOK\r\n");
-            server.send(200, "text/plain", "OK");   /* 先回页面，再做 AP 关闭/STA 重连（重连可能耗时） */
+            server.send(200, "text/plain", "OK");
             close_music_ap();
         } else {
             Serial.print("+MUSICERR\r\n");
-            server.send(400, "text/plain", "MUSIC CRC FAIL");
+            server.send(400, "text/plain", "MUSIC UPLOAD FAIL");
         }
     }
 }

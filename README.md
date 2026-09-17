@@ -106,6 +106,14 @@ ESP-01S 自定义固件：**网页托管 + WebSocket 透传 + OTA 转发 + 音�
 
 ## 更新日志
 
+### 2026-09-18
+
+#### 变更
+- **协议助手全部改为 bool 返回，失败立即停传**：`uart_send_handshake/packet/end`、`uart_music_handshake/end`、`uart_lang_handshake/end` 重试 5 次仍无 ACK 返回 `false`；`handle_music_upload` / `handle_lang_upload` 在**握手失败或任一分包 ACK 失败时立即终止传输**（`musicInProgress/langInProgress=false`），后续 WRITE 只吞字节不再往 UART 灌，END 回 400 —— 避免"STM32 等 ACK、ESP 盲发下一包"导致两边状态机失步（此前是 5 次失败后静默继续上传的经典故障源）
+
+#### 修复
+- 与 STM32 端同步的失败路径闭环：STM32 上传溢出/超时会 Abort 并停止 ACK，ESP 侧在 5 次重试耗尽后终止并以 `+MUSICERR`/`+LANGERR` + 400 结束，不再无限续传
+
 ### 2026-09-16
 
 #### 新增
